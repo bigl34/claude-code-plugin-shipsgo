@@ -1,6 +1,0 @@
-{
-  "shipsgo": {
-    "apiKey": "YOUR_API_KEY",
-    "baseUrl": "https://api.shipsgo.com/v2"
-  }
-}
