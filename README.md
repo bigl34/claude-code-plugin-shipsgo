@@ -43,7 +43,7 @@ ShipsGo ocean container tracking with vessel positions and ETA monitoring
 ```bash
 git clone https://github.com/YOUR_GITHUB_USER/claude-code-plugin-shipsgo.git
 cd claude-code-plugin-shipsgo
-cp scripts/config.template.json scripts/config.json  # fill in your credentials
+cp config.template.json config.json  # fill in your credentials
 cd scripts && npm install
 ```
 
@@ -54,20 +54,11 @@ node scripts/dist/cli.js create-shipment
 ## Installation
 
 1. Clone this repository
-2. Copy `scripts/config.template.json` to `scripts/config.json` and fill in your credentials
+2. Copy `config.template.json` to `config.json` and fill in your credentials
 3. Install dependencies:
    ```bash
    cd scripts && npm install
    ```
-
-## Configuration
-
-Copy `scripts/config.template.json` to `scripts/config.json` and fill in the required values:
-
-| Field | Placeholder |
-|-------|-------------|
-| `shipsgo.apiKey` | `YOUR_API_KEY` |
-| `shipsgo.baseUrl` | `https://api.shipsgo.com/v2` |
 
 ## Available Commands
 
