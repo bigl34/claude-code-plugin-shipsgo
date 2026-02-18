@@ -128,6 +128,6 @@ node dist/cli.js get-sharing-link --id YOUR_SHIPMENT_ID
 - Track non-ocean shipments (air, rail, road)
 
 ## Self-Documentation
-Log API quirks/errors to: `/home/USER/biz/plugin-learnings/shipsgo-container-tracker.md`
+Log API quirks/errors to: `/Users/USER/biz/plugin-learnings/shipsgo-container-tracker.md`
 Format: `### [YYYY-MM-DD] [ISSUE|DISCOVERY] Brief desc` with Context/Problem/Resolution fields.
 Full workflow: `~/biz/docs/reference/agent-shared-context.md`
