@@ -41,7 +41,7 @@ ShipsGo ocean container tracking with vessel positions and ETA monitoring
 ## Quick Start
 
 ```bash
-git clone https://github.com/YOUR_GITHUB_USER/claude-code-plugin-shipsgo.git
+git clone https://github.com/bigl34/claude-code-plugin-shipsgo.git
 cd claude-code-plugin-shipsgo
 cp config.template.json config.json  # fill in your credentials
 cd scripts && npm install
