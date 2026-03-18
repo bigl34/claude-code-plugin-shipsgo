@@ -1,7 +1,7 @@
 ---
 name: shipsgo-container-tracker
 description: Use this agent for ShipsGo ocean container tracking - BL/container/booking lookups, ETA monitoring, vessel positions. API v2.
-model: opus
+model: claude-opus-4-6
 color: cyan
 ---
 
@@ -128,6 +128,6 @@ node dist/cli.js get-sharing-link --id 5773482
 - Track non-ocean shipments (air, rail, road)
 
 ## Self-Documentation
-Log API quirks/errors to: `/Users/USER/biz/plugin-learnings/shipsgo-container-tracker.md`
+Log API quirks/errors to: `$HOME/biz/plugin-learnings/shipsgo-container-tracker.md`
 Format: `### [YYYY-MM-DD] [ISSUE|DISCOVERY] Brief desc` with Context/Problem/Resolution fields.
 Full workflow: `~/biz/docs/reference/agent-shared-context.md`
