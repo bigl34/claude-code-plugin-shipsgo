@@ -3,7 +3,7 @@
 
 ShipsGo ocean container tracking with vessel positions and ETA monitoring
 
-![Version](https://img.shields.io/badge/version-1.1.0-blue) ![License: MIT](https://img.shields.io/badge/License-MIT-green) ![Node >= 18](https://img.shields.io/badge/node-%3E%3D18-brightgreen)
+![Version](https://img.shields.io/badge/version-1.1.1-blue) ![License: MIT](https://img.shields.io/badge/License-MIT-green) ![Node >= 18](https://img.shields.io/badge/node-%3E%3D18-brightgreen)
 
 ## Features
 
@@ -41,7 +41,7 @@ ShipsGo ocean container tracking with vessel positions and ETA monitoring
 ## Quick Start
 
 ```bash
-git clone https://github.com/YOUR_GITHUB_USER/claude-code-plugin-shipsgo.git
+git clone https://github.com/bigl34/claude-code-plugin-shipsgo.git
 cd claude-code-plugin-shipsgo
 cp config.template.json config.json  # fill in your credentials
 cd scripts && npm install
