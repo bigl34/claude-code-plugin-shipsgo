@@ -1,39 +1,73 @@
-/**
- * ShipsGo Container Tracking API Client
- *
- * Direct client using native fetch for ShipsGo API v2.
- * Reads configuration from config.json (symlinked to tmpfs).
- */
 
 import { readFileSync, writeFileSync, existsSync } from "fs";
-import { fileURLToPath } from "url";
-import { dirname, join } from "path";
+import { join } from "path";
+import {
+  getServiceModuleDir,
+  loadServiceConfig,
+  z,
+} from "@local/cli-utils";
 import { PluginCache, TTL, createCacheKey } from "@local/plugin-cache";
+import { isPreSendNetworkError, withRetry } from "./vendor/retry/index.js";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
 
-// Request timeout for API calls (30 seconds)
 const REQUEST_TIMEOUT_MS = 30_000;
+const EPOCH_MILLISECONDS_THRESHOLD = 1_000_000_000_000;
+const HTTP_DATE_PREFIX = /^(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), |(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), |(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) )/i;
 
-// === Configuration ===
-interface ShipsGoConfig {
-  shipsgo: {
-    apiKey: string;
-    baseUrl: string;
-  };
+function isValidDateTimestamp(value: number): boolean {
+  return Number.isFinite(new Date(value).getTime());
 }
 
-// === Internal Types (stable, used by CLI) ===
-// NOTE: API requires FLAT structure, NOT nested reference_numbers
+function parseRateLimitReset(value: string | null): number | undefined {
+  const normalized = value?.trim();
+  if (!normalized || !/^\d+$/.test(normalized)) return undefined;
+
+  const numericValue = Number(normalized);
+  if (!Number.isSafeInteger(numericValue)) return undefined;
+
+  const resetAt = numericValue >= EPOCH_MILLISECONDS_THRESHOLD
+    ? numericValue
+    : numericValue * 1000;
+  return isValidDateTimestamp(resetAt) ? resetAt : undefined;
+}
+
+function parseRetryAfter(value: string | null, now: number): number | undefined {
+  const normalized = value?.trim();
+  if (!normalized) return undefined;
+
+  if (/^\d+$/.test(normalized)) {
+    const deltaSeconds = Number(normalized);
+    const resetAt = now + deltaSeconds * 1000;
+    return Number.isSafeInteger(deltaSeconds) && isValidDateTimestamp(resetAt)
+      ? resetAt
+      : undefined;
+  }
+
+  if (!HTTP_DATE_PREFIX.test(normalized)) return undefined;
+
+  const resetAt = Date.parse(normalized);
+  return isValidDateTimestamp(resetAt) ? resetAt : undefined;
+}
+
+function parseRetryAfterDelaySeconds(value: string | null, now: number): number | undefined {
+  const resetAt = parseRetryAfter(value, now);
+  return resetAt === undefined
+    ? undefined
+    : Math.max(0, Math.ceil((resetAt - now) / 1000));
+}
+
+const ShipsGoConfigSchema = z.object({
+  shipsgo: z.object({
+    apiKey: z.string().min(1),
+    baseUrl: z.string().min(1),
+  }),
+});
+
+type ShipsGoConfig = z.infer<typeof ShipsGoConfigSchema>;
+
 export interface ShipmentCreateRequest {
-  shipment_type: "ocean";
-  bl_number?: string;
   container_number?: string;
   booking_number?: string;
-}
-
-export interface ShipmentUpdateRequest {
   reference?: string;
 }
 
@@ -78,7 +112,7 @@ export interface CreateResult {
   shipment: Shipment;
   source: "created" | "existing" | "cache";
   creditUsed: boolean;
-  warning?: string;  // Non-fatal issues (e.g., PATCH failure for custom reference)
+  warning?: string;
 }
 
 export interface SharingLinkResult {
@@ -91,7 +125,6 @@ export interface SharingLinkResult {
   eta: string | undefined;
 }
 
-// === Rate Limiting ===
 interface RateLimitData {
   serverRemaining?: number;
   serverLimit?: number;
@@ -108,7 +141,6 @@ export interface RateLimitStatus {
   warning?: string;
 }
 
-// === Error Types ===
 export class ApiError extends Error {
   constructor(public status: number, public data: unknown) {
     super(`API Error ${status}: ${JSON.stringify(data)}`);
@@ -118,7 +150,7 @@ export class ApiError extends Error {
 
 export class RateLimitError extends Error {
   constructor(public retryAfter?: number) {
-    super(`Rate limited${retryAfter ? `, retry after ${retryAfter}s` : ""}`);
+    super(`Rate limited${retryAfter !== undefined ? `, retry after ${retryAfter}s` : ""}`);
     this.name = "RateLimitError";
   }
 }
@@ -130,7 +162,39 @@ export class InsufficientCreditsError extends Error {
   }
 }
 
-// Initialize cache with namespace
+export class ShipmentCreateResponseError extends Error {
+  constructor(
+    public outcome: "created_response_invalid" | "duplicate_response_invalid",
+    public data: unknown,
+  ) {
+    const message = outcome === "created_response_invalid"
+      ? "ShipsGo accepted create-shipment but returned no usable shipment; the write outcome is ambiguous, so reconcile with a read before retrying"
+      : "ShipsGo reported ALREADY_EXISTS but returned no usable shipment; reconcile with a read before retrying";
+    super(message);
+    this.name = "ShipmentCreateResponseError";
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function unwrapCreatedShipment(value: unknown): Record<string, unknown> | null {
+  if (!isRecord(value)) return null;
+
+  if (Object.prototype.hasOwnProperty.call(value, "shipment")) {
+    return isRecord(value.shipment) ? value.shipment : null;
+  }
+
+  return value.id !== undefined || value.requestId !== undefined ? value : null;
+}
+
+interface FetchWithRetryOptions {
+  maxRetries: number;
+  baseDelay: number;
+  operationKind?: "read" | "write";
+}
+
 const cache = new PluginCache({
   namespace: "shipsgo-container-tracker",
   defaultTTL: TTL.HOUR,
@@ -142,56 +206,40 @@ export class ShipsGoClient {
   private rateLimitFile: string;
 
   constructor() {
-    const configPath = join(__dirname, "..", "config.json");
-    this.config = JSON.parse(readFileSync(configPath, "utf-8"));
-    this.rateLimitFile = join(__dirname, ".ratelimit.json");
-
-    if (!this.config.shipsgo?.apiKey) {
-      throw new Error("Missing required config in config.json: shipsgo.apiKey");
-    }
+    this.config = loadServiceConfig("shipsgo-container-tracker", {
+      schema: ShipsGoConfigSchema,
+    });
+    this.rateLimitFile = join(
+      getServiceModuleDir("shipsgo-container-tracker"),
+      ".ratelimit.json",
+    );
   }
 
-  // ============================================
-  // CACHE CONTROL
-  // ============================================
 
-  /** Disables caching for all subsequent requests. */
   disableCache(): void {
     this.cacheDisabled = true;
     cache.disable();
   }
 
-  /** Re-enables caching after it was disabled. */
   enableCache(): void {
     this.cacheDisabled = false;
     cache.enable();
   }
 
-  /** Returns cache statistics including hit/miss counts. */
   getCacheStats() {
     return cache.getStats();
   }
 
-  /** Clears all cached data. @returns Number of cache entries cleared */
   clearCache(): number {
     return cache.clear();
   }
 
-  /**
-   * Invalidates cached data for a specific shipment.
-   *
-   * @param id - Shipment ID to invalidate
-   * @returns True if any entry was found and removed
-   */
   invalidateShipment(id: string): boolean {
     const shipmentInvalidated = cache.invalidate(createCacheKey("shipment:id", { id }));
     const sharingLinkInvalidated = cache.invalidate(createCacheKey("sharing-link", { id }));
     return shipmentInvalidated || sharingLinkInvalidated;
   }
 
-  // ============================================
-  // RATE LIMITING
-  // ============================================
 
   private loadRateLimitData(): RateLimitData {
     try {
@@ -199,7 +247,6 @@ export class ShipsGoClient {
         return JSON.parse(readFileSync(this.rateLimitFile, "utf-8"));
       }
     } catch {
-      // Ignore parse errors
     }
     return { localCalls: [] };
   }
@@ -208,41 +255,33 @@ export class ShipsGoClient {
     try {
       writeFileSync(this.rateLimitFile, JSON.stringify(data, null, 2));
     } catch {
-      // Ignore write errors
     }
   }
 
   private updateRateLimitFromResponse(response: Response): void {
     const data = this.loadRateLimitData();
+    const now = Date.now();
 
     const remaining = response.headers.get("X-RateLimit-Remaining");
     const limit = response.headers.get("X-RateLimit-Limit");
-    const reset = response.headers.get("X-RateLimit-Reset") || response.headers.get("Retry-After");
+    const providerResetAt = parseRateLimitReset(response.headers.get("X-RateLimit-Reset"));
+    const retryResetAt = parseRetryAfter(response.headers.get("Retry-After"), now);
 
     if (remaining) data.serverRemaining = parseInt(remaining, 10);
     if (limit) data.serverLimit = parseInt(limit, 10);
-    if (reset) {
-      // Could be epoch seconds or seconds from now
-      const resetVal = parseInt(reset, 10);
-      data.serverResetAt = resetVal > 1e10 ? resetVal : Date.now() + resetVal * 1000;
+    if (providerResetAt !== undefined) {
+      data.serverResetAt = providerResetAt;
+    } else if (retryResetAt !== undefined) {
+      data.serverResetAt = retryResetAt;
     }
-    data.lastServerUpdate = Date.now();
+    data.lastServerUpdate = now;
 
-    // Track locally as backup
-    data.localCalls.push(Date.now());
-    data.localCalls = data.localCalls.filter(t => t > Date.now() - 60_000);
+    data.localCalls.push(now);
+    data.localCalls = data.localCalls.filter(t => t > now - 60_000);
 
     this.saveRateLimitData(data);
   }
 
-  /**
-   * Gets current rate limit status.
-   *
-   * Uses server-reported headers when available, falls back to local tracking.
-   * Warning issued when approaching limit (< 20 remaining).
-   *
-   * @returns Rate limit info including remaining calls and reset time
-   */
   getRateLimitStatus(): RateLimitStatus {
     const data = this.loadRateLimitData();
     const hasRecentServerData = data.lastServerUpdate && (Date.now() - data.lastServerUpdate) < 60_000;
@@ -266,7 +305,6 @@ export class ShipsGoClient {
     };
   }
 
-  // === HTTP Helpers ===
   private async request<T>(
     method: string,
     endpoint: string,
@@ -279,7 +317,6 @@ export class ShipsGoClient {
       "X-Shipsgo-User-Token": this.config.shipsgo.apiKey,
     };
 
-    // Set up timeout with AbortController
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
@@ -295,8 +332,11 @@ export class ShipsGoClient {
       this.updateRateLimitFromResponse(response);
 
       if (response.status === 429) {
-        const retryAfter = response.headers.get("Retry-After");
-        throw new RateLimitError(retryAfter ? parseInt(retryAfter, 10) : undefined);
+        const retryAfter = parseRetryAfterDelaySeconds(
+          response.headers.get("Retry-After"),
+          Date.now(),
+        );
+        throw new RateLimitError(retryAfter);
       }
 
       if (response.status === 402) {
@@ -318,49 +358,41 @@ export class ShipsGoClient {
 
   private async fetchWithRetry<T>(
     fn: () => Promise<T>,
-    options: { maxRetries: number; baseDelay: number } = { maxRetries: 3, baseDelay: 1000 }
+    options: FetchWithRetryOptions = { maxRetries: 3, baseDelay: 1000 }
   ): Promise<T> {
-    let lastError: Error | null = null;
-
-    for (let attempt = 0; attempt <= options.maxRetries; attempt++) {
-      try {
-        return await fn();
-      } catch (error) {
-        lastError = error as Error;
-
-        // Don't retry client errors (4xx except 429)
-        if (error instanceof ApiError && error.status >= 400 && error.status < 500 && error.status !== 429) {
-          throw error;
+    const result = await withRetry(fn, {
+      maxRetries: options.maxRetries,
+      baseDelayMs: options.baseDelay,
+      maxDelayMs: Number.MAX_SAFE_INTEGER,
+      jitterPercent: 0,
+      retryableErrors: [],
+      nextDelayMs: ({ attempt, error }) => {
+        if (error instanceof RateLimitError && error.retryAfter !== undefined) {
+          return error.retryAfter * 1000;
         }
+        return options.baseDelay * Math.pow(2, attempt) + Math.random() * 500;
+      },
+      shouldRetry: (error) => {
+        return !(error instanceof ApiError && error.status >= 400 && error.status < 500 && error.status !== 429);
+      },
+      operationKind: options.operationKind,
+      isPreSendError: isPreSendNetworkError,
+      sleepImpl: (ms) => this.sleep(ms),
+      logger: () => {},
+    });
 
-        // Don't retry on last attempt
-        if (attempt === options.maxRetries) {
-          break;
-        }
-
-        // Calculate delay with exponential backoff + jitter
-        let delay = options.baseDelay * Math.pow(2, attempt) + Math.random() * 500;
-
-        // Use Retry-After if available
-        if (error instanceof RateLimitError && error.retryAfter) {
-          delay = error.retryAfter * 1000;
-        }
-
-        await this.sleep(delay);
-      }
+    if (result.success) {
+      return result.data as T;
     }
 
-    throw lastError ?? new Error("Max retries exceeded");
+    throw result.error ?? new Error("Max retries exceeded");
   }
 
   private sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
-  // === Type Mapping ===
   private mapToShipment(raw: Record<string, unknown>): Shipment {
-    // Map from raw API response to internal Shipment type
-    // The exact mapping depends on ShipsGo's actual response format
     const shipment: Shipment = {
       id: String(raw.id || raw.requestId || ""),
       requestId: raw.requestId ? String(raw.requestId) : undefined,
@@ -371,10 +403,9 @@ export class ShipsGoClient {
       carrier: raw.carrier as string || raw.shippingLine as string,
       created_at: raw.createdAt as string || raw.created_at as string || new Date().toISOString(),
       updated_at: raw.updatedAt as string || raw.updated_at as string || new Date().toISOString(),
-      custom_reference: raw.customReference as string || raw.custom_reference as string,
+      custom_reference: raw.reference as string || raw.customReference as string || raw.custom_reference as string,
     };
 
-    // Map vessel
     if (raw.vessel || raw.vesselName) {
       shipment.vessel = {
         name: (raw.vessel as { name?: string })?.name || raw.vesselName as string || "",
@@ -382,7 +413,6 @@ export class ShipsGoClient {
       };
     }
 
-    // Map POL (Port of Loading)
     if (raw.pol || raw.portOfLoading) {
       const pol = raw.pol as Record<string, unknown> || {};
       shipment.pol = {
@@ -392,7 +422,6 @@ export class ShipsGoClient {
       };
     }
 
-    // Map POD (Port of Discharge)
     if (raw.pod || raw.portOfDischarge) {
       const pod = raw.pod as Record<string, unknown> || {};
       shipment.pod = {
@@ -403,7 +432,6 @@ export class ShipsGoClient {
       };
     }
 
-    // Map milestones
     if (Array.isArray(raw.milestones) || Array.isArray(raw.events)) {
       const events = (raw.milestones || raw.events) as Array<Record<string, unknown>>;
       shipment.milestones = events.map(e => ({
@@ -414,7 +442,6 @@ export class ShipsGoClient {
       }));
     }
 
-    // Map coordinates
     if (raw.coordinates || (raw.latitude && raw.longitude)) {
       const coords = raw.coordinates as Record<string, number> || {};
       shipment.coordinates = {
@@ -464,142 +491,156 @@ export class ShipsGoClient {
   }
 
   private buildCacheKey(data: ShipmentCreateRequest): string {
-    if (data.bl_number) return createCacheKey("shipment:bl", { bl: data.bl_number });
-    if (data.container_number) return createCacheKey("shipment:container", { container: data.container_number });
-    if (data.booking_number) return createCacheKey("shipment:booking", { booking: data.booking_number });
-    return createCacheKey("shipment:unknown", {});
+    const reference = data.reference?.trim() || undefined;
+
+    if (data.booking_number) {
+      return createCacheKey("shipment:booking", {
+        booking: data.booking_number.toUpperCase(),
+        reference,
+      });
+    }
+    if (data.container_number) {
+      return createCacheKey("shipment:container", {
+        container: data.container_number.toUpperCase(),
+        reference,
+      });
+    }
+    return createCacheKey("shipment:unknown", { reference });
   }
 
-  // ============================================
-  // VALIDATION
-  // ============================================
+  private getReferenceWarning(
+    data: ShipmentCreateRequest,
+    shipment: Shipment,
+    source: CreateResult["source"],
+  ): string | undefined {
+    if (!data.reference || shipment.custom_reference === data.reference) return undefined;
 
-  /**
-   * Validates Bill of Lading number format.
-   * Expected: 4-char carrier prefix + 8-12 digits.
-   */
+    if (source === "cache") {
+      return "The cached shipment did not confirm the requested reference; no ShipsGo create or update request was sent.";
+    }
+    if (source === "existing") {
+      return "ShipsGo reported an existing shipment without confirming the requested reference; no standalone reference update was attempted.";
+    }
+    return "ShipsGo accepted the create request, but its response did not confirm the requested reference; reconcile with a read before retrying.";
+  }
+
+  private async writeShipmentCache(cacheKey: string, shipment: Shipment): Promise<void> {
+    await cache.set(cacheKey, shipment, { ttl: this.getCacheTTL(shipment) });
+  }
+
+  private async publishAcceptedShipmentToCache(
+    cacheKey: string,
+    shipment: Shipment,
+    source: "created" | "existing",
+  ): Promise<string | undefined> {
+    try {
+      await this.writeShipmentCache(cacheKey, shipment);
+      return undefined;
+    } catch {
+      const acceptance = source === "created"
+        ? "ShipsGo accepted create-shipment"
+        : "ShipsGo confirmed ALREADY_EXISTS";
+      return `${acceptance}, but local cache publication failed. The returned shipment.id is the authoritative provider identity; do not retry create-shipment solely because of this warning.`;
+    }
+  }
+
+  private combineWarnings(...warnings: Array<string | undefined>): string | undefined {
+    const present = warnings.filter((warning): warning is string => Boolean(warning));
+    return present.length > 0 ? present.join(" ") : undefined;
+  }
+
+
   validateBLNumber(bl: string): boolean {
-    // BL numbers typically: carrier prefix (4 chars) + digits
     return /^[A-Z]{4}\d{8,12}$/i.test(bl.toUpperCase());
   }
 
-  /**
-   * Validates container number format.
-   * Expected: ISO 6346 format (4 letters + 7 digits).
-   */
   validateContainerNumber(container: string): boolean {
-    // ISO 6346 format: 4 letters + 7 digits (last is check digit)
     return /^[A-Z]{4}\d{7}$/i.test(container.toUpperCase());
   }
 
-  /**
-   * Validates booking number format.
-   * Expected: Alphanumeric, 6-20 characters.
-   */
   validateBookingNumber(booking: string): boolean {
-    // Carrier-specific, generally alphanumeric 6-20 chars
     return /^[A-Z0-9]{6,20}$/i.test(booking);
   }
 
-  // ============================================
-  // SHIPMENT MANAGEMENT
-  // ============================================
 
-  /**
-   * Creates or retrieves a shipment for tracking.
-   *
-   * Uses credit-saving strategy:
-   * 1. Checks cache first (free)
-   * 2. If 409 (already exists), fetches existing (free)
-   * 3. Only creates new if needed (1 credit)
-   *
-   * NOTE: API requires FLAT structure (bl_number, container_number at root, not nested).
-   * Custom reference requires separate PATCH call after creation.
-   *
-   * @param data - Shipment creation request with reference numbers (flat structure)
-   * @param customReference - Optional custom reference (applied via PATCH after creation)
-   * @returns Shipment details with source and credit usage info
-   *
-   * @throws {RateLimitError} If rate limited
-   * @throws {InsufficientCreditsError} If no credits available
-   */
-  async createShipment(data: ShipmentCreateRequest, customReference?: string): Promise<CreateResult> {
+  async createShipment(data: ShipmentCreateRequest): Promise<CreateResult> {
     const cacheKey = this.buildCacheKey(data);
 
-    // Step 1: Check cache first (always free)
     const cachedResult = cache.get<Shipment>(cacheKey);
     if (cachedResult.hit && cachedResult.data && !cachedResult.data.discarded_at) {
-      return { shipment: cachedResult.data, source: "cache", creditUsed: false };
+      return {
+        shipment: cachedResult.data,
+        source: "cache",
+        creditUsed: false,
+        warning: this.getReferenceWarning(data, cachedResult.data, "cache"),
+      };
     }
 
-    // Step 2: Attempt create with flat structure
     return this.fetchWithRetry(async () => {
-      const { data: responseData, response } = await this.request<Record<string, unknown>>(
+      const { data: responseData, response } = await this.request<unknown>(
         "POST",
         "/ocean/shipments",
-        data  // Flat structure: { shipment_type, bl_number?, container_number?, booking_number? }
+        data,
       );
 
-      // Handle responses
       if (response.status === 200 || response.status === 201) {
-        const shipment = this.mapToShipment(responseData);
-
-        // Update reference via PATCH if provided (non-fatal if fails)
-        let warning: string | undefined;
-        if (customReference && shipment.id) {
-          try {
-            const { response: patchResponse } = await this.request<Record<string, unknown>>(
-              "PATCH",
-              `/ocean/shipments/${shipment.id}`,
-              { reference: customReference } as ShipmentUpdateRequest
-            );
-            if (!patchResponse.ok) {
-              warning = `Reference update failed (${patchResponse.status}). Shipment created but reference not set.`;
-            }
-          } catch (e) {
-            warning = `Reference update failed: ${e instanceof Error ? e.message : "Unknown error"}`;
-          }
+        const rawShipment = unwrapCreatedShipment(responseData);
+        if (!rawShipment) {
+          throw new ShipmentCreateResponseError("created_response_invalid", responseData);
         }
 
-        cache.set(cacheKey, shipment, { ttl: this.getCacheTTL(shipment) });
-        return { shipment, source: "created" as const, creditUsed: true, warning };
+        const shipment = this.mapToShipment(rawShipment);
+        if (!shipment.id) {
+          throw new ShipmentCreateResponseError("created_response_invalid", responseData);
+        }
+
+        const cacheWarning = await this.publishAcceptedShipmentToCache(
+          cacheKey,
+          shipment,
+          "created",
+        );
+        return {
+          shipment,
+          source: "created" as const,
+          creditUsed: true,
+          warning: this.combineWarnings(
+            this.getReferenceWarning(data, shipment, "created"),
+            cacheWarning,
+          ),
+        };
       }
 
       if (response.status === 409) {
-        // Already exists - fetch existing
-        const existing = await this.fetchByReference(data);
-        if (existing) {
-          cache.set(cacheKey, existing, { ttl: this.getCacheTTL(existing) });
-          return { shipment: existing, source: "existing" as const, creditUsed: false };
+        const rawShipment = unwrapCreatedShipment(responseData);
+        if (!rawShipment) {
+          throw new ShipmentCreateResponseError("duplicate_response_invalid", responseData);
         }
-        throw new Error("409 returned but shipment not found");
+
+        const existing = this.mapToShipment(rawShipment);
+        if (!existing.id) {
+          throw new ShipmentCreateResponseError("duplicate_response_invalid", responseData);
+        }
+
+        const cacheWarning = await this.publishAcceptedShipmentToCache(
+          cacheKey,
+          existing,
+          "existing",
+        );
+        return {
+          shipment: existing,
+          source: "existing" as const,
+          creditUsed: false,
+          warning: this.combineWarnings(
+            this.getReferenceWarning(data, existing, "existing"),
+            cacheWarning,
+          ),
+        };
       }
 
       throw new ApiError(response.status, responseData);
-    });
+    }, { maxRetries: 3, baseDelay: 1000, operationKind: "write" });
   }
 
-  private async fetchByReference(data: ShipmentCreateRequest): Promise<Shipment | null> {
-    if (data.bl_number) {
-      return this.trackByBL(data.bl_number);
-    }
-    if (data.container_number) {
-      return this.trackByContainer(data.container_number);
-    }
-    if (data.booking_number) {
-      return this.trackByBooking(data.booking_number);
-    }
-    return null;
-  }
-
-  /**
-   * Gets a shipment by its ID.
-   *
-   * @param id - ShipsGo shipment ID
-   * @returns Shipment details
-   *
-   * @cached TTL: 2 hours
-   */
   async getShipmentById(id: string): Promise<Shipment> {
     const cacheKey = createCacheKey("shipment:id", { id });
 
@@ -621,14 +662,6 @@ export class ShipsGoClient {
     );
   }
 
-  /**
-   * Lists shipments with optional filters.
-   *
-   * @param options - Query options (status, limit, offset, ETA range, sort)
-   * @returns Shipment list and total count
-   *
-   * @cached TTL: 15 minutes
-   */
   async listShipments(options?: ListOptions): Promise<{ shipments: Shipment[]; count: number }> {
     const cacheKey = createCacheKey("list:shipments", {
       status: options?.status,
@@ -674,18 +707,7 @@ export class ShipsGoClient {
     );
   }
 
-  // ============================================
-  // TRACKING QUERIES
-  // ============================================
 
-  /**
-   * Tracks shipment by Bill of Lading number.
-   *
-   * @param blNumber - BL number (case-insensitive)
-   * @returns Shipment if found, null otherwise
-   *
-   * @cached TTL: 2 hours
-   */
   async trackByBL(blNumber: string): Promise<Shipment | null> {
     const cacheKey = createCacheKey("shipment:bl", { bl: blNumber.toUpperCase() });
 
@@ -711,14 +733,6 @@ export class ShipsGoClient {
     );
   }
 
-  /**
-   * Tracks shipment by container number.
-   *
-   * @param containerNumber - ISO 6346 container number (case-insensitive)
-   * @returns Shipment if found, null otherwise
-   *
-   * @cached TTL: 2 hours
-   */
   async trackByContainer(containerNumber: string): Promise<Shipment | null> {
     const cacheKey = createCacheKey("shipment:container", { container: containerNumber.toUpperCase() });
 
@@ -744,14 +758,6 @@ export class ShipsGoClient {
     );
   }
 
-  /**
-   * Tracks shipment by booking number.
-   *
-   * @param bookingNumber - Carrier booking number (case-insensitive)
-   * @returns Shipment if found, null otherwise
-   *
-   * @cached TTL: 2 hours
-   */
   async trackByBooking(bookingNumber: string): Promise<Shipment | null> {
     const cacheKey = createCacheKey("shipment:booking", { booking: bookingNumber.toUpperCase() });
 
@@ -777,14 +783,6 @@ export class ShipsGoClient {
     );
   }
 
-  /**
-   * Searches shipments by any reference (BL, container, booking, or custom).
-   *
-   * @param reference - Reference string to search
-   * @returns Matching shipments (may be empty)
-   *
-   * @cached TTL: 15 minutes
-   */
   async searchByReference(reference: string): Promise<Shipment[]> {
     const cacheKey = createCacheKey("search", { ref: reference });
 
@@ -808,17 +806,7 @@ export class ShipsGoClient {
     );
   }
 
-  // ============================================
-  // STATUS & MONITORING
-  // ============================================
 
-  /**
-   * Gets all active shipments (EN_ROUTE and PENDING).
-   *
-   * @returns All active shipments
-   *
-   * @cached TTL: 15 minutes
-   */
   async getActiveShipments(): Promise<Shipment[]> {
     const cacheKey = createCacheKey("list:active", {});
 
@@ -834,14 +822,6 @@ export class ShipsGoClient {
     );
   }
 
-  /**
-   * Gets shipments arriving within N days.
-   *
-   * @param days - Number of days to look ahead (default: 7)
-   * @returns Shipments with ETA in range
-   *
-   * @cached TTL: 30 minutes
-   */
   async getArrivingSoon(days: number = 7): Promise<Shipment[]> {
     const cacheKey = createCacheKey("list:arriving", { days });
 
@@ -864,25 +844,11 @@ export class ShipsGoClient {
     );
   }
 
-  /**
-   * Gets tracking milestones for a shipment.
-   *
-   * @param id - Shipment ID
-   * @returns Array of milestone events
-   */
   async getMilestones(id: string): Promise<Milestone[]> {
     const shipment = await this.getShipmentById(id);
     return shipment.milestones || [];
   }
 
-  /**
-   * Gets live vessel position for a shipment.
-   *
-   * @param id - Shipment ID
-   * @returns Coordinates and vessel name, or null if unavailable
-   *
-   * @cached TTL: 30 minutes
-   */
   async getVesselPosition(id: string): Promise<{ lat: number; lng: number; vessel: string } | null> {
     const cacheKey = createCacheKey("position", { id });
 
@@ -912,15 +878,7 @@ export class ShipsGoClient {
     );
   }
 
-  // ============================================
-  // UTILITIES
-  // ============================================
 
-  /**
-   * Checks API connectivity and key validity.
-   *
-   * @returns Status including rate limit info
-   */
   async getApiStatus(): Promise<{ valid: boolean; message: string; details?: unknown }> {
     try {
       const { response } = await this.request<unknown>("GET", "/ocean/shipments?limit=1");
@@ -945,48 +903,32 @@ export class ShipsGoClient {
     }
   }
 
-  /**
-   * Gets a shareable public tracking link for a shipment.
-   * Uses the v2 API tokens.map field to construct the URL.
-   *
-   * @param id - ShipsGo shipment ID
-   * @returns Sharing link with shipment summary, or null if token not yet available
-   * @throws {ApiError} For non-404 HTTP errors
-   */
   async getSharingLink(id: string): Promise<SharingLinkResult | null> {
     const cacheKey = createCacheKey("sharing-link", { id });
     const cached = cache.get<SharingLinkResult>(cacheKey);
 
-    // Return cached result if available (but don't cache nulls)
     if (cached.hit && cached.data) {
       return cached.data;
     }
 
-    // Fetch raw response to access tokens.map (not mapped in Shipment interface)
     const { data, response } = await this.request<Record<string, unknown>>(
       "GET",
       `/ocean/shipments/${id}`
     );
 
-    // Match error handling pattern from getShipmentById
     if (!response.ok) {
       if (response.status === 404) return null;
       throw new ApiError(response.status, data);
     }
 
-    // Extract token - check both possible response shapes
-    // Shape 1: { shipment: { tokens: { map } } } (documented)
-    // Shape 2: { tokens: { map } } (if response IS the shipment)
     const shipmentData = (data.shipment as Record<string, unknown>) || data;
     const tokens = shipmentData.tokens as { map?: string } | undefined;
     const mapToken = tokens?.map;
 
     if (!mapToken) {
-      // Token not available yet - don't cache null (token may appear later)
       return null;
     }
 
-    // Extract shipment details for convenience
     const route = shipmentData.route as Record<string, unknown> | undefined;
     const pol = route?.port_of_loading as Record<string, unknown> | undefined;
     const pod = route?.port_of_discharge as Record<string, unknown> | undefined;
@@ -1001,17 +943,14 @@ export class ShipsGoClient {
       eta: pod?.date_of_discharge as string | undefined,
     };
 
-    // Cache successful results for 1 day (tokens are stable once assigned)
     cache.set(cacheKey, result, { ttl: TTL.DAY });
     return result;
   }
 
-  // === Selection Logic ===
   private selectBestMatch(shipments: Shipment[]): Shipment | null {
     if (shipments.length === 0) return null;
     if (shipments.length === 1) return shipments[0];
 
-    // Prefer: non-discarded, most recent, active status
     return shipments
       .filter(s => !s.discarded_at)
       .sort((a, b) => {
@@ -1026,16 +965,11 @@ export class ShipsGoClient {
         const statusDiff = (statusOrder[a.status] ?? 5) - (statusOrder[b.status] ?? 5);
         if (statusDiff !== 0) return statusDiff;
 
-        // Most recent first
         return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
       })[0] ?? shipments[0];
   }
 
-  // ============================================
-  // TOOL LIST
-  // ============================================
 
-  /** Returns list of available CLI commands with descriptions. */
   getTools(): Array<{ name: string; description: string }> {
     return [
       { name: "create-shipment", description: "Create/track a new shipment (1 credit if new)" },

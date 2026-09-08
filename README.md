@@ -3,7 +3,7 @@
 
 ShipsGo ocean container tracking with vessel positions and ETA monitoring
 
-![Version](https://img.shields.io/badge/version-1.1.1-blue) ![License: MIT](https://img.shields.io/badge/License-MIT-green) ![Node >= 18](https://img.shields.io/badge/node-%3E%3D18-brightgreen)
+![Version](https://img.shields.io/badge/version-1.1.2-blue) ![License: MIT](https://img.shields.io/badge/License-MIT-green) ![Node >= 18](https://img.shields.io/badge/node-%3E%3D18-brightgreen)
 
 ## Features
 
@@ -44,11 +44,11 @@ ShipsGo ocean container tracking with vessel positions and ETA monitoring
 git clone https://github.com/bigl34/claude-code-plugin-shipsgo.git
 cd claude-code-plugin-shipsgo
 cp config.template.json config.json  # fill in your credentials
-cd scripts && npm install
+npm --prefix scripts install
 ```
 
 ```bash
-node scripts/dist/cli.js create-shipment
+npm --prefix scripts run cli -- create-shipment
 ```
 
 ## Installation
@@ -60,15 +60,23 @@ node scripts/dist/cli.js create-shipment
    cd scripts && npm install
    ```
 
+## Configuration
+
+Copy `config.template.json` to `config.json` and fill in the required values:
+
+| Field | Placeholder |
+|-------|-------------|
+| `credentials_path` | `/path/to/your/credentials` |
+
 ## Available Commands
 
 ### Shipment Management
 
-| Command           | Description                                        | Required Options                                                      |
-| ----------------- | -------------------------------------------------- | --------------------------------------------------------------------- |
-| `create-shipment` | Create/track a new shipment (uses 1 credit if new) | `--bl`, `--container`, or `--booking` (at least one)                  |
-| `get-shipment`    | Get shipment details by ID                         | `--id <shipment_id>`                                                  |
-| `list-shipments`  | List shipments with filters                        | Optional: `--status`, `--limit`, `--offset`, `--eta-from`, `--eta-to` |
+| Command           | Description                                        | Required Options                                                             |
+| ----------------- | -------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `create-shipment` | Create/track a new shipment (uses 1 credit if new) | `--bl`, `--container`, or `--booking` (at least one); optional `--reference` |
+| `get-shipment`    | Get shipment details by ID                         | `--id <shipment_id>`                                                         |
+| `list-shipments`  | List shipments with filters                        | Optional: `--status`, `--limit`, `--offset`, `--eta-from`, `--eta-to`        |
 
 ### Tracking Queries
 
@@ -109,23 +117,23 @@ node scripts/dist/cli.js create-shipment
 ## Usage Examples
 
 ```bash
-node scripts/dist/cli.js create-shipment --container HAMU1058953 --reference SO-12345
+npm --prefix "scripts" run cli -- create-shipment --container HAMU1058953 --reference SO-12345 --confirm
 ```
 
 ```bash
-node scripts/dist/cli.js arriving-soon --days 14
+npm --prefix "scripts" run cli -- arriving-soon --days 14
 ```
 
 ```bash
-node scripts/dist/cli.js vessel-position --id abc123
+npm --prefix "scripts" run cli -- vessel-position --id abc123
 ```
 
 ```bash
-node scripts/dist/cli.js search --query SO-12345
+npm --prefix "scripts" run cli -- search --query SO-12345
 ```
 
 ```bash
-node scripts/dist/cli.js get-sharing-link --id YOUR_SHIPMENT_ID
+npm --prefix "scripts" run cli -- get-sharing-link --id YOUR_SHIPMENT_ID
 # Returns: https://map.shipsgo.com/ocean/shipments/1234567?token=example-token-uuid
 ```
 
